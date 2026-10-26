@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.16)
+project(ThreadForge VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+find_package(Threads REQUIRED)
+
+add_library(threadforge src/thread_pool.cpp)
+target_include_directories(threadforge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(threadforge PUBLIC Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+    target_compile_options(threadforge PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(basic_usage examples/basic_usage.cpp)
+target_link_libraries(basic_usage PRIVATE threadforge)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(thread_pool_tests tests/thread_pool_tests.cpp)
+    target_link_libraries(thread_pool_tests PRIVATE threadforge)
+    add_test(NAME thread_pool_tests COMMAND thread_pool_tests)
+    add_test(NAME basic_usage COMMAND basic_usage)
+    set_tests_properties(thread_pool_tests basic_usage PROPERTIES TIMEOUT 30)
+endif()
