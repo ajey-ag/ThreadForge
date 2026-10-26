@@ -50,7 +50,8 @@ private:
 void validation() {
     expect_throw<std::invalid_argument>([] { threadforge::ThreadPool pool(0); });
     threadforge::ThreadPool pool(1);
-    expect_throw<std::invalid_argument>([&] { pool.submit({}); });
+    auto empty = pool.submit(std::function<void()>{});
+    expect_throw<std::bad_function_call>([&] { empty.get(); });
     int result = 0;
     pool.submit([&] { result = 42; });
     pool.shutdown();
@@ -159,6 +160,103 @@ void idle_shutdown() {
     pool.shutdown();
     require(pool.failed_task_count() == 0, "Idle pool reported task failures");
 }
+
+int add(int a, int b) { return a + b; }
+
+void futures_and_ownership() {
+    threadforge::ThreadPool pool(2);
+    auto sum = pool.submit(add, 10, 20);
+    auto moved = pool.submit([](std::unique_ptr<int> p) { return *p; }, std::make_unique<int>(7));
+    auto capture = pool.submit([p = std::make_unique<int>(9)] { return *p; });
+    int borrowed = 0;
+    auto reference = pool.submit([](int& value) { value = 5; }, std::ref(borrowed));
+    auto failure = pool.submit([]() -> int { throw std::runtime_error("expected"); });
+    require(sum.get() == 30 && moved.get() == 7 && capture.get() == 9, "Typed task result mismatch");
+    reference.get();
+    require(borrowed == 5, "Reference wrapper did not borrow");
+    expect_throw<std::runtime_error>([&] { failure.get(); });
+    pool.shutdown();
+    require(pool.failed_task_count() == 1, "Future failure not counted");
+}
+
+void priorities_and_capacity() {
+    Gate gate;
+    threadforge::ThreadPool pool(1, threadforge::SchedulingPolicy::Priority, 4);
+    pool.submit([&] { gate.arrive_and_wait(); });
+    gate.wait_for(1);
+    std::vector<int> order;
+    pool.submit_with_priority(threadforge::Priority::Low, [&] { order.push_back(4); });
+    pool.submit_with_priority(threadforge::Priority::High, [&] { order.push_back(1); });
+    pool.submit_with_priority(threadforge::Priority::Normal, [&] { order.push_back(3); });
+    pool.submit_with_priority(threadforge::Priority::High, [&] { order.push_back(2); });
+    bool full = false;
+    try { pool.submit([] {}); } catch (const threadforge::QueueFull&) { full = true; }
+    gate.open();
+    pool.shutdown();
+    require(full, "Bounded queue failed to reject overload");
+    require(order == std::vector<int>({1, 2, 3, 4}), "Priority or stable ordering failed");
+}
+
+void cancellation_and_states() {
+    Gate gate;
+    std::optional<threadforge::TaskHandle> survivor;
+    {
+        threadforge::ThreadPool pool(1, threadforge::SchedulingPolicy::Fifo, 1);
+        auto running = pool.submit_cancellable([&] { gate.arrive_and_wait(); });
+        gate.wait_for(1);
+        bool running_rejected = !running.handle.cancel();
+        auto queued = pool.submit_cancellable([] { return 42; });
+        bool cancelled = queued.handle.cancel();
+        bool duplicate_rejected = !queued.handle.cancel();
+        // Cancellation frees capacity immediately, even while the worker is blocked.
+        auto replacement = pool.submit([] { return 7; });
+        survivor = queued.handle;
+        gate.open();
+        pool.shutdown();
+        require(running_rejected && cancelled && duplicate_rejected, "Cancellation transition failed");
+        require(queued.handle.state() == threadforge::TaskState::Cancelled, "Cancelled state missing");
+        require(running.handle.state() == threadforge::TaskState::Completed, "Completed state missing");
+        expect_throw<threadforge::TaskCancelled>([&] { queued.future.get(); });
+        require(replacement.get() == 7, "Cancellation did not release capacity");
+    }
+    require(!survivor->cancel(), "Handle accessed destroyed pool");
+}
+
+void cancel_pending_shutdown() {
+    Gate gate;
+    threadforge::ThreadPool pool(1);
+    auto running = pool.submit([&] { gate.arrive_and_wait(); });
+    gate.wait_for(1);
+    auto queued = pool.submit([] { return 42; });
+    std::thread closer([&] { pool.shutdown(threadforge::ShutdownMode::CancelPending); });
+    // Pending futures settle before the blocked running task is released.
+    bool cancelled = false;
+    try { queued.get(); } catch (const threadforge::TaskCancelled&) { cancelled = true; }
+    gate.open();
+    closer.join();
+    running.get();
+    require(cancelled, "CancelPending executed queued work");
+}
+
+void cancellation_race() {
+    threadforge::ThreadPool pool(4);
+    std::atomic<unsigned> executed{0};
+    std::vector<threadforge::Submission<void>> tasks;
+    for (int i = 0; i < 2000; ++i) {
+        tasks.push_back(pool.submit_cancellable([&] { ++executed; }));
+    }
+    unsigned cancelled = 0;
+    std::thread canceller([&] {
+        for (auto& task : tasks) { if (task.handle.cancel()) { ++cancelled; } }
+    });
+    pool.shutdown();
+    canceller.join();
+    unsigned errors = 0;
+    for (auto& task : tasks) {
+        try { task.future.get(); } catch (const threadforge::TaskCancelled&) { ++errors; }
+    }
+    require(errors == cancelled && executed.load() + cancelled == tasks.size(), "Cancel/dequeue race lost work");
+}
 } // namespace
 
 int main() {
@@ -169,7 +267,12 @@ int main() {
         {"shutdown_race", shutdown_race},
         {"exceptions_and_worker_shutdown", exceptions_and_worker_shutdown},
         {"drain_running_and_queued", drain_running_and_queued},
-        {"idle_shutdown", idle_shutdown}
+        {"idle_shutdown", idle_shutdown},
+        {"futures_and_ownership", futures_and_ownership},
+        {"priorities_and_capacity", priorities_and_capacity},
+        {"cancellation_and_states", cancellation_and_states},
+        {"cancel_pending_shutdown", cancel_pending_shutdown},
+        {"cancellation_race", cancellation_race}
     };
     for (const auto& test : tests) {
         try {

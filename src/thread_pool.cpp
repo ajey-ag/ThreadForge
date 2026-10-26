@@ -1,96 +1,105 @@
 #include "threadforge/thread_pool.hpp"
-
 #include <stdexcept>
 #include <utility>
 
 namespace threadforge {
-
 thread_local ThreadPool* ThreadPool::current_pool_ = nullptr;
 
-ThreadPool::ThreadPool(std::size_t worker_count) {
-    if (worker_count == 0) {
-        throw std::invalid_argument("ThreadPool requires at least one worker");
-    }
-    workers_.reserve(worker_count);
+ThreadPool::ThreadPool(std::size_t workers, SchedulingPolicy policy, std::size_t capacity)
+    : state_(std::make_shared<detail::PoolState>(policy)), queue_capacity_(capacity) {
+    if (workers == 0) { throw std::invalid_argument("ThreadPool requires at least one worker"); }
+    workers_.reserve(workers);
     try {
-        for (std::size_t i = 0; i < worker_count; ++i) {
+        for (std::size_t i = 0; i < workers; ++i) {
             workers_.emplace_back([this] { worker_loop(); });
         }
     } catch (...) {
-        // A failed constructor has no destructor: explicitly join created workers.
         shutdown();
         throw;
     }
 }
+ThreadPool::~ThreadPool() { shutdown(); }
 
-ThreadPool::~ThreadPool() {
-    shutdown();
-}
-
-void ThreadPool::submit(std::function<void()> task) {
-    if (!task) {
-        throw std::invalid_argument("Cannot submit an empty task");
-    }
+void ThreadPool::enqueue(Task task) {
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (state_ != State::Running) {
-            throw std::runtime_error("ThreadPool is shutting down");
-        }
-        tasks_.push(std::move(task));
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->lifecycle != detail::Lifecycle::Running) { throw PoolClosed(); }
+        if (queue_capacity_ != 0 && state_->tasks.size() >= queue_capacity_) { throw QueueFull(); }
+        state_->tasks.push(std::move(task));
     }
-    work_available_.notify_one();
+    state_->available.notify_one();
 }
 
-void ThreadPool::shutdown() {
-    if (current_pool_ == this) {
-        throw std::logic_error("A worker cannot join its own pool");
+bool TaskHandle::cancel() const {
+    auto pool = pool_.lock();
+    if (!pool) { return false; }
+    std::optional<Task> removed;
+    {
+        std::lock_guard<std::mutex> lock(pool->mutex);
+        if (control_->state.load(std::memory_order_relaxed) != TaskState::Queued) { return false; }
+        removed = pool->tasks.remove(control_);
+        if (!removed) { return false; }
+        control_->state.store(TaskState::Cancelled, std::memory_order_release);
+        ++pool->active_cancellations;
     }
-    // Serializes joins. Workers never acquire this mutex.
+    removed->execute(); // Resolves cancellation; never invokes the user's callable.
+    {
+        std::lock_guard<std::mutex> lock(pool->mutex);
+        --pool->active_cancellations;
+    }
+    pool->available.notify_all();
+    return true;
+}
+
+void ThreadPool::shutdown(ShutdownMode mode) {
+    if (current_pool_ == this) { throw std::logic_error("A worker cannot join its own pool"); }
+    if (mode != ShutdownMode::Graceful && mode != ShutdownMode::CancelPending) {
+        throw std::invalid_argument("Invalid shutdown mode");
+    }
+    // Declared before the lock: captured user resources are destroyed after unlocking.
+    std::vector<Task> cancelled;
     std::lock_guard<std::mutex> shutdown_lock(shutdown_mutex_);
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (state_ == State::Stopped) {
-            return;
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->lifecycle == detail::Lifecycle::Stopped) { return; }
+        if (mode == ShutdownMode::CancelPending) { cancelled.reserve(state_->tasks.size()); }
+        state_->lifecycle = detail::Lifecycle::Draining;
+        if (mode == ShutdownMode::CancelPending) {
+            while (!state_->tasks.empty()) {
+                auto task = state_->tasks.pop();
+                task.control->state.store(TaskState::Cancelled, std::memory_order_release);
+                cancelled.push_back(std::move(task));
+            }
         }
-        state_ = State::Draining;
     }
-    work_available_.notify_all();
-    for (auto& worker : workers_) {
-        worker.join();
-    }
+    state_->available.notify_all();
+    for (auto& task : cancelled) { task.execute(); }
+    for (auto& worker : workers_) { worker.join(); }
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        state_ = State::Stopped;
+        std::unique_lock<std::mutex> lock(state_->mutex);
+        state_->available.wait(lock, [this] { return state_->active_cancellations == 0; });
+        state_->lifecycle = detail::Lifecycle::Stopped;
     }
-}
-
-std::size_t ThreadPool::failed_task_count() const noexcept {
-    return failed_tasks_.load(std::memory_order_relaxed);
 }
 
 void ThreadPool::worker_loop() {
     current_pool_ = this;
     for (;;) {
-        std::function<void()> task;
+        Task task;
         {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            work_available_.wait(lock, [this] {
-                return state_ != State::Running || !tasks_.empty();
+            std::unique_lock<std::mutex> lock(state_->mutex);
+            state_->available.wait(lock, [this] {
+                return state_->lifecycle != detail::Lifecycle::Running || !state_->tasks.empty();
             });
-            if (tasks_.empty()) {
-                break; // Predicate guarantees shutdown has started.
-            }
-            task = std::move(tasks_.front());
-            tasks_.pop();
+            if (state_->tasks.empty()) { break; }
+            task = state_->tasks.pop();
+            task.control->state.store(TaskState::Running, std::memory_order_release);
         }
-        try {
-            task();
-        } catch (...) {
-            failed_tasks_.fetch_add(1, std::memory_order_relaxed);
+        task.execute();
+        if (task.control->state.load(std::memory_order_acquire) == TaskState::Failed) {
+            state_->failed.fetch_add(1, std::memory_order_relaxed);
         }
-        // Callable and captured resources are destroyed outside the queue lock.
     }
     current_pool_ = nullptr;
 }
-
-} // namespace threadforge
+}

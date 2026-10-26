@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 
-add_library(threadforge src/thread_pool.cpp)
+add_library(threadforge src/thread_pool.cpp src/scheduler.cpp)
 target_include_directories(threadforge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(threadforge PUBLIC Threads::Threads)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
