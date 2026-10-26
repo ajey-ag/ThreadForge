@@ -7,7 +7,7 @@ Scheduler::Scheduler(SchedulingPolicy policy) : policy_(policy) {
         throw std::invalid_argument("Invalid scheduling policy");
     }
 }
-void Scheduler::push(Task task) {
+void Scheduler::push(Task&& task) {
     const auto priority = static_cast<std::size_t>(task.priority);
     if (priority >= queues_.size()) { throw std::invalid_argument("Invalid priority"); }
     queues_[policy_ == SchedulingPolicy::Fifo ? 0 : priority].push_back(std::move(task));

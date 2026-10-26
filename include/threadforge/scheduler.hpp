@@ -11,7 +11,7 @@ enum class SchedulingPolicy { Fifo, Priority };
 class Scheduler {
 public:
     explicit Scheduler(SchedulingPolicy policy);
-    void push(Task task);
+    void push(Task&& task);
     Task pop();
     std::optional<Task> remove(const std::shared_ptr<detail::TaskControl>& control);
     bool empty() const noexcept { return size_ == 0; }

@@ -257,6 +257,36 @@ void cancellation_race() {
     }
     require(errors == cancelled && executed.load() + cancelled == tasks.size(), "Cancel/dequeue race lost work");
 }
+
+void metrics_accounting() {
+    Gate gate;
+    threadforge::ThreadPool pool(1);
+    auto empty = pool.metrics();
+    require(!empty.mean_execution_ns && empty.submitted == 0, "Empty metrics should have no averages");
+    pool.submit([&] { gate.arrive_and_wait(); });
+    gate.wait_for(1);
+    auto cancelled = pool.submit_cancellable([] {});
+    pool.submit([] { throw std::runtime_error("failure"); });
+    pool.submit([] {});
+    const bool did_cancel = cancelled.handle.cancel();
+    auto during = pool.metrics();
+    gate.open();
+    pool.shutdown();
+    require(did_cancel && during.queue_depth == 2 && during.running == 1, "Live metrics mismatch");
+    auto final = pool.metrics();
+    require(final.submitted == 4 && final.completed == 2 && final.failed == 1 && final.cancelled == 1,
+            "Terminal metrics mismatch");
+    require(final.queue_depth == 0 && final.running == 0 && final.peak_queue_depth == 3,
+            "Queue metrics mismatch");
+    require(final.timing_samples == 3 && final.mean_queue_wait_ns && final.mean_execution_ns &&
+            final.mean_completion_latency_ns && final.throughput_per_second > 0, "Timing metrics missing");
+    require(*final.mean_completion_latency_ns >= *final.mean_execution_ns, "Invalid timestamp boundaries");
+    threadforge::ThreadPool untimed(1, threadforge::SchedulingPolicy::Fifo, 0, false);
+    untimed.submit([] {});
+    untimed.shutdown();
+    require(!untimed.metrics().mean_execution_ns && untimed.metrics().completed == 1,
+            "Disabling timings must preserve counts");
+}
 } // namespace
 
 int main() {
@@ -272,7 +302,8 @@ int main() {
         {"priorities_and_capacity", priorities_and_capacity},
         {"cancellation_and_states", cancellation_and_states},
         {"cancel_pending_shutdown", cancel_pending_shutdown},
-        {"cancellation_race", cancellation_race}
+        {"cancellation_race", cancellation_race},
+        {"metrics_accounting", metrics_accounting}
     };
     for (const auto& test : tests) {
         try {

@@ -1,6 +1,7 @@
 #pragma once
 #include "threadforge/errors.hpp"
 #include "threadforge/scheduler.hpp"
+#include "threadforge/metrics.hpp"
 #include <condition_variable>
 #include <future>
 #include <memory>
@@ -16,12 +17,13 @@ enum class ShutdownMode { Graceful, CancelPending };
 namespace detail {
 enum class Lifecycle { Running, Draining, Stopped };
 struct PoolState {
-    explicit PoolState(SchedulingPolicy policy) : tasks(policy) {}
+    explicit PoolState(SchedulingPolicy policy, bool timing) : tasks(policy), timing_enabled(timing) {}
     std::mutex mutex;
     std::condition_variable available;
     Scheduler tasks;
     Lifecycle lifecycle = Lifecycle::Running;
-    std::atomic<std::size_t> failed{0};
+    MetricsData metrics;
+    const bool timing_enabled;
     std::size_t active_cancellations = 0;
 };
 }
@@ -30,7 +32,7 @@ struct PoolState {
 class ThreadPool final {
 public:
     explicit ThreadPool(std::size_t workers, SchedulingPolicy policy = SchedulingPolicy::Fifo,
-                        std::size_t queue_capacity = 0);
+                        std::size_t queue_capacity = 0, bool timing_metrics = true);
     ~ThreadPool();
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
@@ -91,7 +93,8 @@ public:
 
     // First shutdown caller chooses the mode; subsequent callers wait for that shutdown.
     void shutdown(ShutdownMode mode = ShutdownMode::Graceful);
-    std::size_t failed_task_count() const noexcept { return state_->failed.load(std::memory_order_relaxed); }
+    Metrics metrics() const;
+    std::size_t failed_task_count() const { return metrics().failed; }
 
 private:
     void enqueue(Task task);

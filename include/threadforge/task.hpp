@@ -3,6 +3,9 @@
 #include <atomic>
 #include <memory>
 #include <future>
+#include <stdexcept>
+#include <utility>
+#include <chrono>
 namespace threadforge {
 enum class Priority { High = 0, Normal = 1, Low = 2 };
 enum class TaskState { Queued, Running, Completed, Failed, Cancelled };
@@ -14,7 +17,10 @@ class ThreadPool;
 class TaskHandle {
 public:
     bool cancel() const;
-    TaskState state() const noexcept { return control_->state.load(std::memory_order_acquire); }
+    TaskState state() const {
+        if (!control_) { throw std::logic_error("Moved-from task handle"); }
+        return control_->state.load(std::memory_order_acquire);
+    }
 private:
     friend class ThreadPool;
     TaskHandle(std::weak_ptr<detail::PoolState> pool, std::shared_ptr<detail::TaskControl> control)
@@ -30,5 +36,6 @@ struct Task {
     std::function<void()> execute;
     Priority priority = Priority::Normal;
     std::shared_ptr<detail::TaskControl> control;
+    std::chrono::steady_clock::time_point enqueued{};
 };
 }
