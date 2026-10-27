@@ -1,54 +1,60 @@
-# Phase 1 architecture and concurrency model
+# ThreadForge architecture
 
-## Ownership and synchronization
+The pool owns persistent workers and shared queue state containing the scheduler,
+lifecycle, condition variable, mutex and metrics. Task handles hold weak references
+to that state and independent atomic task state. Futures own result state separately.
 
-The pool owns its threads, queue, mutexes, condition variable, and lifecycle state.
-Every queue access and lifecycle read/write holds `queue_mutex_`. Tasks leave the
-queue via move, then execute and release their captured resources outside that
-mutex. No user task runs under a scheduler lock. Each successful insertion has
-one matching dequeue; no worker can see the same queue entry twice.
+## Submission and ownership
 
-`shutdown_mutex_` serializes external shutdown callers and protects thread joins.
-The only nested lock order is shutdown mutex then queue mutex. Workers and
-submitters acquire only the queue mutex. Shutdown releases the queue mutex before
-joining, so workers can continue draining. The relaxed atomic failure counter
-provides a standalone count, not a publication mechanism for task results.
+The template API decay-copies/moves a callable and arguments into a one-shot
+invocation. A promise supplies a typed future. A copyable queue wrapper owns the
+invocation through shared ownership, allowing move-only inputs in C++17. Rejected
+admission throws synchronously and destroys resources after leaving the queue lock.
+Accepted admission updates the queue and counters together under that lock.
 
-## Wakeups and worker lifecycle
+The scheduler provides FIFO, stable three-level priority and experimental
+per-worker-deque work stealing. It has no internal mutex: the pool supplies all
+synchronization. Capacity is global waiting-task count, excluding running work.
 
-Construction rejects zero workers, reserves thread storage, then starts workers.
-If creation fails midway, the constructor drains and joins the workers already
-created before rethrowing. Allocation failure before the first thread needs no
-cleanup. All member synchronization objects exist before threads start.
+## Workers
 
-Workers wait using the predicate `state != Running || !queue.empty()` under the
-queue mutex. Waiting atomically releases the mutex and sleeps; reacquisition and
-predicate checking handle spurious wakeups. Submit publishes queue changes under
-the same mutex then notifies one worker. Shutdown publishes Draining and notifies
-all workers, including idle ones. Persistent predicate state avoids lost wakeups
-even if notification happens before a worker begins waiting.
+Construction validates inputs and starts workers. On partial thread-creation
+failure, created workers are closed and joined before rethrowing. Each worker
+waits for a nonempty queue or lifecycle change, dequeues under the mutex, publishes
+Running, then unlocks before invocation. It publishes result/error and terminal
+state, accounts for completion under the mutex, then destroys captured resources
+outside the lock. Threads persist across tasks and never detach.
 
-When awakened, a worker takes one queued task or exits if the queue is empty and
-shutdown has started. An exception in user code increments the failure counter
-and does not terminate the worker. Thread-local pool identity rejects self-join
-before taking the shutdown mutex (including while another caller is joining).
+User exceptions become future exceptions and Failed state; workers continue.
+Future readiness may slightly precede terminal state/accounting. Shutdown provides
+fully settled final accounting.
 
-## Shutdown linearization
+## Cancellation
 
-Running -> Draining -> Stopped is monotonic. Submission racing with shutdown is
-accepted exactly when its queue insertion wins the queue lock before the Draining
-transition. Rejected submissions throw synchronously and are never queued.
-Shutdown joins running workers as well as draining queued tasks. Return from join
-synchronizes with worker completion, so callers may safely inspect task-written
-state afterward if tasks did not race with each other while writing it.
+Queued -> Running and Queued -> Cancelled compete under the same mutex. Handles
+remove queued work immediately, free capacity, and resolve TaskCancelled outside
+the lock without invoking user code. The cancellation exception is allocated once
+at construction. In-flight cancellation resolution is tracked so shutdown waits
+for it. Running or terminal tasks cannot be cancelled.
 
-The destructor is RAII cleanup, not a cure for invalid object lifetime: callers
-must prevent concurrent access during destruction. Tasks must not destroy their
-own pool. Infinite tasks or dependency deadlocks prevent graceful shutdown.
+## Shutdown
 
-## Review limits
+Running -> Draining -> Stopped is monotonic. The shutdown mutex serializes joins;
+the queue mutex decides admission versus closure. Graceful mode closes admission,
+wakes workers, drains and joins. CancelPending removes queued work, resolves its
+futures, and joins running work. Removed captures are destroyed after both locks
+are released. The first caller selects the mode; later callers wait.
 
-Partial worker creation cleanup is covered by code inspection, not deterministic
-fault injection. Tests exercise FIFO with one worker because scheduling after
-dequeue is controlled by the OS. Multithreaded stress testing and sanitizers
-increase confidence but cannot prove absence of all possible races.
+Thread-local worker identity rejects self-shutdown before attempting the shutdown
+mutex. Destruction requires exclusive object lifetime and must occur off-pool.
+Infinite user work or dependency cycles can prevent graceful completion.
+
+## Metrics and costs
+
+Counts and aggregate timings share the queue mutex for coherent snapshots. Timing
+can be disabled; accounting locks remain. Benchmarks own per-task latency arrays;
+the engine keeps bounded aggregates. Shared locks, task allocations, type erasure
+and futures are explicit correctness-first costs.
+
+See concurrency_model.md, scheduling_policies.md and benchmark_methodology.md for
+invariants, ordering, fairness and measurement boundaries.

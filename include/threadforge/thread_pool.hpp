@@ -17,13 +17,16 @@ enum class ShutdownMode { Graceful, CancelPending };
 namespace detail {
 enum class Lifecycle { Running, Draining, Stopped };
 struct PoolState {
-    explicit PoolState(SchedulingPolicy policy, bool timing) : tasks(policy), timing_enabled(timing) {}
+    explicit PoolState(SchedulingPolicy policy, bool timing, std::size_t workers)
+        : tasks(policy, workers), timing_enabled(timing) {}
     std::mutex mutex;
     std::condition_variable available;
     Scheduler tasks;
     Lifecycle lifecycle = Lifecycle::Running;
     MetricsData metrics;
     const bool timing_enabled;
+    // Allocate the cancellation exception before any task can be accepted.
+    const std::exception_ptr cancellation_error = std::make_exception_ptr(TaskCancelled());
     std::size_t active_cancellations = 0;
 };
 }
@@ -69,9 +72,9 @@ public:
             return std::apply(std::move(function), std::move(arguments));
         };
         auto owned = std::make_shared<decltype(invocation)>(std::move(invocation));
-        Task task{[control, promise, owned] {
+        Task task{[control, promise, owned, cancellation_error = state_->cancellation_error] {
             if (control->state.load(std::memory_order_acquire) == TaskState::Cancelled) {
-                promise->set_exception(std::make_exception_ptr(TaskCancelled()));
+                promise->set_exception(cancellation_error);
                 return;
             }
             try {
@@ -98,8 +101,9 @@ public:
 
 private:
     void enqueue(Task task);
-    void worker_loop();
+    void worker_loop(std::size_t worker);
     static thread_local ThreadPool* current_pool_;
+    static thread_local std::size_t current_worker_;
     std::shared_ptr<detail::PoolState> state_;
     const std::size_t queue_capacity_;
     std::mutex shutdown_mutex_;

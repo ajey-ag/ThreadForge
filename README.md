@@ -1,111 +1,179 @@
 # ThreadForge
 
-A C++17 task execution engine built incrementally to study systems programming,
-concurrency correctness, and performance. **This repository implements Phase 1
-only:** a fixed-size FIFO worker pool with graceful shutdown.
+ThreadForge is a reusable C++17 task execution engine for studying systems
+programming, concurrency correctness, scheduling and performance measurement.
+It uses the standard library, CMake and CTest, with Linux/Ubuntu/WSL2 as the
+primary environment. It has no CUDA, web application or external C++ dependency.
 
-Implemented features:
+Phases 1–5 are implemented. Phase 6 adds an **experimental work-stealing policy**
+with per-worker deques and serialized queue access; it is not lock-free and does
+not claim better scalability. See [validation](docs/validation.md) for actual
+build, test, sanitizer and benchmark results.
 
-- Persistent workers sleeping on a condition variable when idle.
-- Thread-safe submission of copyable `void()` callables to an unbounded queue.
-- Exactly-once invocation of accepted tasks, including concurrent producers.
-- Graceful, idempotent shutdown; concurrent external shutdown calls are serialized.
-- Zero-worker and empty-task rejection; cleanup after partial thread creation.
-- Task exception containment and a failure counter.
-- A 100-task example and dependency-free CTest correctness tests.
+## Build and run on your Windows machine
 
-## Build and run (Ubuntu / WSL2)
+Open PowerShell, enter Ubuntu, then run the Linux commands:
 
-Install GCC and CMake if needed: `sudo apt-get install build-essential cmake`.
-From the repository directory:
+```powershell
+wsl -d Ubuntu
+```
 
 ```sh
+cd /mnt/c/Users/dell/Documents/project/ThreadForge
+# Already installed during development; needed on a fresh Ubuntu installation:
+sudo apt-get install build-essential cmake
+
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j 2
 ctest --test-dir build --output-on-failure
+
 ./build/basic_usage
+./build/parallel_tasks
+./build/priority_demo
 ```
 
-CMake requires C++17, disables language extensions, and enables `-Wall -Wextra
--Wpedantic` for GCC/Clang. The core uses only the standard library.
+`basic_usage` verifies 100 tasks execute exactly once. `parallel_tasks` demonstrates
+results, move-only inputs and exception propagation. `priority_demo` creates a
+controlled backlog, demonstrates High/Normal/Low order and cancels a queued task.
+This project is a C++ library with command-line examples, not a GUI application.
+On native Linux, use your checkout path instead of the `/mnt/c/...` path.
+
+CMake requires standard C++17 without extensions and enables `-Wall -Wextra
+-Wpedantic` on GCC/Clang. Use `-j 2` to limit compiler memory usage; increase it if
+your machine has spare memory. Build directories are ignored by Git.
+
+## Use the library
+
+Link your CMake target to `threadforge` and include the public header:
 
 ```cpp
 #include <threadforge/thread_pool.hpp>
-#include <atomic>
 
-std::atomic<int> completed{0}; // Captured state outlives pool work.
 threadforge::ThreadPool pool(4);
-pool.submit([&completed] { ++completed; });
-pool.shutdown(); // All accepted tasks have finished; completed == 1.
+auto sum = pool.submit([](int a, int b) { return a + b; }, 10, 20);
+int value = sum.get(); // 30; rethrows the task's exception if it failed.
+pool.shutdown();      // All accepted work is settled before return.
 ```
 
-## Contract and architecture
+The constructor accepts worker count, policy, waiting-queue capacity and whether
+task timing is enabled:
 
-Workers dequeue from one shared FIFO under a mutex, release it, and invoke the
-task. FIFO describes dequeue order; multiple workers can start and finish in a
-different order. Submissions are ordered by successful insertion under the mutex.
+```cpp
+threadforge::ThreadPool pool(
+    4, threadforge::SchedulingPolicy::Priority, 256, true);
+auto urgent = pool.submit_with_priority(threadforge::Priority::High, [] { return 42; });
+auto pending = pool.submit_cancellable([] { return 7; });
+if (pending.handle.cancel()) {
+    // pending.future.get() throws threadforge::TaskCancelled.
+}
+pool.shutdown();
+```
 
-`submit` takes ownership of a `std::function<void()>`. Lambdas, function pointers,
-and copyable callable objects work; bind arguments with captures. Reference
-captures remain the caller's responsibility. Move-only callables, typed return
-values, and futures are not implemented yet.
+- Policies: `Fifo` (default), `Priority`, experimental `WorkStealing`.
+- Capacity zero means unbounded; otherwise it counts queued tasks, not running ones.
+- `QueueFull` and `PoolClosed` throw synchronously; rejected work is not accepted.
+- `submit_cancellable_with_priority` combines handles and explicit priority.
+- Cancellation succeeds only while queued, frees capacity immediately, and never
+  forcibly terminates running code. Handles expose `TaskState` and can outlive the
+  pool. A moved-from handle cannot cancel; querying its state throws `logic_error`.
+- `shutdown(ShutdownMode::CancelPending)` cancels queued work and waits for running
+  work. Default shutdown drains all work. The first shutdown caller chooses the
+  mode; concurrent later callers wait for that shutdown. The destructor drains.
 
-Shutdown changes Running to Draining under the queue mutex. Further submissions
-throw `std::runtime_error`; accepted tasks drain before workers exit and are joined.
-Stopped is reached after all joins. The destructor performs the same shutdown.
-An empty callable throws `std::invalid_argument`. A failed queue allocation throws
-without accepting the task. Rejected tasks are never invoked.
+Callables and arguments are decay-copied/moved into the task, then invoked once
+as rvalues. Move-only captures and arguments work. Use `std::ref` for explicit
+borrowing; referenced objects must outlive execution. Function and member pointers,
+lambdas and callable objects follow C++17 invocation rules. Void and reference
+results work. Empty `std::function` reports `bad_function_call` through its future.
+A returned reference does not extend the referenced object's lifetime.
 
-Task exceptions are caught at the worker boundary and counted by
-`failed_task_count()`; workers continue. Phase 1 does **not** propagate those
-exceptions to the submitter. After shutdown the failure count is final.
+## Architecture and contracts
 
-The pool must outlive every call to it. Destruction may not overlap public calls,
-and must happen on a non-worker thread. Calling `shutdown()` from its own worker
-throws `std::logic_error`; destroying the pool there violates the lifetime contract
-and terminates through its noexcept destructor. Tasks must eventually return:
-shutdown cannot forcibly stop user code. Avoid task dependency cycles, including
-waiting for work queued behind a task on an exhausted pool or cross-pool joins.
+Workers sleep on a predicate-based condition variable. One mutex protects queue
+ownership, admission, task dequeue/cancellation and metric accounting. User code
+and captured-resource destruction occur outside that mutex. A separate mutex
+serializes shutdown/join. Lifecycle is Running → Draining → Stopped.
 
-See [architecture and concurrency](docs/architecture.md) and
-[Phase 1 learning notes](docs/phase1_review.md).
+FIFO is dequeue order, not completion order. Priority is stable within a level,
+nonpreemptive and can starve lower-priority work. Work stealing uses round-robin
+external placement, worker-local placement for nested tasks, local LIFO removal
+and cyclic FIFO stealing. All deque access still shares the pool mutex.
 
-## Testing and analysis
+The pool must outlive all calls, including handle cancellation; destruction must
+not overlap public calls. Do not destroy a pool from one of its own workers.
+Calling shutdown from its own worker throws `logic_error`; violating the destructor
+contract terminates through the noexcept destructor. Tasks must eventually return.
+Waiting for child futures inside an exhausted pool can deadlock even with work
+stealing. No real-time guarantees, forced interruption or dependency scheduling
+are provided.
 
-Tests coordinate with mutexes and condition variables, not arbitrary sleeps.
-CTest gives each executable a 30-second timeout so a deadlock fails validation.
-Checks remain active in release builds. Repeat the concurrency suite with:
+`metrics()` returns coherent counts, queue depth/peak, running tasks, steals,
+optional mean wait/execution/completion times in nanoseconds, and lifetime
+throughput. Successful completion, failure and cancellation are distinct counts.
+A future can become ready just before terminal state/accounting is published;
+call shutdown before expecting final counts. Timing averages are absent with no
+samples or when timing is disabled. Counts remain enabled. See
+[metric boundaries and benchmark methodology](docs/benchmark_methodology.md).
+
+## Tests and sanitizers
 
 ```sh
-ctest --test-dir build --repeat until-fail:20 --output-on-failure
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+ctest --test-dir build --output-on-failure
+ctest --test-dir build -R thread_pool_tests --repeat until-fail:20 --output-on-failure
+./build/stress_tests
+
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DTHREADFORGE_SANITIZER=address -DCMAKE_CXX_FLAGS=
 cmake --build build-asan -j 2
 ctest --test-dir build-asan --output-on-failure
-cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DTHREADFORGE_SANITIZER=thread -DCMAKE_CXX_FLAGS=
 cmake --build build-tsan -j 2
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-Run ThreadSanitizer separately from AddressSanitizer. Runtime support varies by
-kernel and address-space configuration, including WSL. Startup failures are not
-evidence of either a data race or race freedom. See
-[actual validation results](docs/validation.md).
+Address mode combines AddressSanitizer and UndefinedBehaviorSanitizer. Thread mode
+runs separately. The empty CMAKE_CXX_FLAGS clears any old manually supplied
+sanitizer flags in reused build directories. Sanitizer runtime support varies by
+kernel/address-space setup. Startup failures are reported separately from races.
+Tests use synchronization rather than arbitrary sleeps; CTest applies timeouts.
+The stress executable checks 30,000 tasks per policy across concurrent producers,
+including cancellation, exceptions, typed results and exactly-once accounting.
 
-## Trade-offs and roadmap
+## Benchmarks
 
-The shared mutex keeps ownership and shutdown easy to reason about, but can limit
-throughput. The unbounded queue avoids blocking-submission deadlocks at the cost of
-unbounded memory growth. `std::function` simplifies ownership but requires copyable
-targets and may allocate. No performance claims or benchmark results are made.
+```sh
+bash scripts/run_benchmarks.sh benchmarks/results/my-run --tasks 2000 --repeats 5 --iterations 20000 --max-workers 8
+```
 
-- Phase 2: typed futures, return values, and exception propagation.
-- Phase 3: priority scheduling, capacity, and overload policies.
-- Phase 4: queued-task cancellation and explicit task lifecycle.
-- Phase 5: timing metrics, reproducible benchmarks, profiling, and optimization.
-- Phase 6 (optional): work stealing and controlled scalability comparisons.
+This builds Release, runs tests, then saves `my-run.csv` and
+`my-run.environment.txt`. Choose a fresh output prefix for each experiment. Default
+workloads cover CPU, very short, mixed-duration, simulated blocking, and larger
+batches. Rows compare serial execution, FIFO with timing on/off, priority and work
+stealing. Each run includes warm-up, repeated measurements, checked results,
+throughput, latency percentiles, mean queue/execution time and scaling efficiency.
 
-Benchmark instructions will be added with the benchmark suite in Phase 5. There
-are no priorities, cancellation, bounded queues, timing metrics, or real-time
-guarantees in this version.
+For a quick run after building Release:
+
+```sh
+./build-release/threadforge_benchmark --tasks 100 --repeats 2 --iterations 2000 --max-workers 4 --output benchmarks/results/quick.csv
+```
+
+The script accepts `THREADFORGE_BUILD_DIR=/var/tmp/threadforge-release` to build on
+WSL's Linux filesystem, which was faster here than the mounted Windows directory.
+Benchmarks are environment-specific; the tiny-task case often loses to serial
+execution because coordination costs exceed useful work. See the checked-in
+[results](benchmarks/results) and [methodology](docs/benchmark_methodology.md).
+
+## Design notes and learning path
+
+- [Architecture](docs/architecture.md) and [concurrency model](docs/concurrency_model.md)
+- [Scheduling policies](docs/scheduling_policies.md) and [design decisions](docs/design_decisions.md)
+- Phase reviews: [1](docs/phase1_review.md), [2](docs/phase2_review.md),
+  [3](docs/phase3_review.md), [4](docs/phase4_review.md), [5](docs/phase5_review.md),
+  [6](docs/phase6_review.md). Each records concepts, trade-offs and five interview questions.
+- [Validation commands and results](docs/validation.md)
+
+Remaining research: per-deque locks and less contended accounting, fairness/aging,
+allocation pooling, dependency-aware waiting, deterministic thread-creation fault
+injection, and broader compiler/platform tests. These are not implemented features.
+Changes should follow measured bottlenecks, not assumed speedups. MIT licensed.

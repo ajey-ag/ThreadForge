@@ -5,14 +5,15 @@
 
 namespace threadforge {
 thread_local ThreadPool* ThreadPool::current_pool_ = nullptr;
+thread_local std::size_t ThreadPool::current_worker_ = 0;
 
 ThreadPool::ThreadPool(std::size_t workers, SchedulingPolicy policy, std::size_t capacity, bool timing)
-    : state_(std::make_shared<detail::PoolState>(policy, timing)), queue_capacity_(capacity) {
+    : state_(std::make_shared<detail::PoolState>(policy, timing, workers)), queue_capacity_(capacity) {
     if (workers == 0) { throw std::invalid_argument("ThreadPool requires at least one worker"); }
     workers_.reserve(workers);
     try {
         for (std::size_t i = 0; i < workers; ++i) {
-            workers_.emplace_back([this] { worker_loop(); });
+            workers_.emplace_back([this, i] { worker_loop(i); });
         }
     } catch (...) {
         shutdown();
@@ -27,7 +28,8 @@ void ThreadPool::enqueue(Task task) {
         if (state_->lifecycle != detail::Lifecycle::Running) { throw PoolClosed(); }
         if (queue_capacity_ != 0 && state_->tasks.size() >= queue_capacity_) { throw QueueFull(); }
         if (state_->timing_enabled) { task.enqueued = detail::Clock::now(); }
-        state_->tasks.push(std::move(task));
+        const auto owner = current_pool_ == this ? std::optional<std::size_t>(current_worker_) : std::nullopt;
+        state_->tasks.push(std::move(task), owner);
         ++state_->metrics.counts.submitted;
         state_->metrics.counts.peak_queue_depth = std::max(state_->metrics.counts.peak_queue_depth, state_->tasks.size());
     }
@@ -90,8 +92,9 @@ void ThreadPool::shutdown(ShutdownMode mode) {
     }
 }
 
-void ThreadPool::worker_loop() {
+void ThreadPool::worker_loop(std::size_t worker) {
     current_pool_ = this;
+    current_worker_ = worker;
     for (;;) {
         Task task;
         detail::Clock::time_point started;
@@ -101,7 +104,9 @@ void ThreadPool::worker_loop() {
                 return state_->lifecycle != detail::Lifecycle::Running || !state_->tasks.empty();
             });
             if (state_->tasks.empty()) { break; }
-            task = state_->tasks.pop();
+            const auto steals_before = state_->tasks.steals();
+            task = state_->tasks.pop(worker);
+            state_->metrics.counts.stolen += state_->tasks.steals() - steals_before;
             task.control->state.store(TaskState::Running, std::memory_order_release);
             ++state_->metrics.counts.running;
             if (state_->timing_enabled) { started = detail::Clock::now(); }

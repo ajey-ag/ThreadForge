@@ -287,6 +287,49 @@ void metrics_accounting() {
     require(!untimed.metrics().mean_execution_ns && untimed.metrics().completed == 1,
             "Disabling timings must preserve counts");
 }
+
+void work_stealing() {
+    threadforge::ThreadPool pool(2, threadforge::SchedulingPolicy::WorkStealing);
+    std::promise<void> submitted, release;
+    auto ready = submitted.get_future();
+    auto gate = release.get_future();
+    std::vector<std::future<int>> children;
+    auto parent = pool.submit([&] {
+        for (int i = 0; i < 32; ++i) { children.push_back(pool.submit([i] { return i; })); }
+        submitted.set_value();
+        gate.wait();
+    });
+    ready.get();
+    int sum = 0;
+    for (auto& child : children) { sum += child.get(); }
+    release.set_value();
+    parent.get();
+    pool.shutdown();
+    require(sum == 496 && pool.metrics().stolen >= 32, "Idle worker did not steal local submissions");
+}
+
+void policy_lifecycle_matrix() {
+    for (const auto policy : {threadforge::SchedulingPolicy::Fifo, threadforge::SchedulingPolicy::Priority,
+                              threadforge::SchedulingPolicy::WorkStealing}) {
+        Gate gate;
+        threadforge::ThreadPool pool(2, policy, 2);
+        pool.submit([&] { gate.arrive_and_wait(); });
+        pool.submit([&] { gate.arrive_and_wait(); });
+        gate.wait_for(2);
+        auto cancelled = pool.submit_cancellable([] { return 42; });
+        const bool did_cancel = cancelled.handle.cancel();
+        auto shutdown_cancelled = pool.submit([] { return 7; });
+        std::thread closer([&] { pool.shutdown(threadforge::ShutdownMode::CancelPending); });
+        bool cancellation_error = false;
+        try { shutdown_cancelled.get(); } catch (const threadforge::TaskCancelled&) { cancellation_error = true; }
+        gate.open();
+        closer.join();
+        expect_throw<threadforge::TaskCancelled>([&] { cancelled.future.get(); });
+        auto counts = pool.metrics();
+        require(did_cancel && cancellation_error && counts.completed == 2 && counts.cancelled == 2 &&
+                counts.submitted == 4 && counts.queue_depth == 0, "Policy lifecycle mismatch");
+    }
+}
 } // namespace
 
 int main() {
@@ -303,7 +346,9 @@ int main() {
         {"cancellation_and_states", cancellation_and_states},
         {"cancel_pending_shutdown", cancel_pending_shutdown},
         {"cancellation_race", cancellation_race},
-        {"metrics_accounting", metrics_accounting}
+        {"metrics_accounting", metrics_accounting},
+        {"work_stealing", work_stealing},
+        {"policy_lifecycle_matrix", policy_lifecycle_matrix}
     };
     for (const auto& test : tests) {
         try {

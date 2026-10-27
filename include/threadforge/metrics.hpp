@@ -13,6 +13,7 @@ struct Metrics {
     std::size_t queue_depth = 0;
     std::size_t peak_queue_depth = 0;
     std::size_t timing_samples = 0; // Completed + failed, when timing is enabled.
+    std::size_t stolen = 0; // Work actually dequeued from another worker's deque.
     std::optional<double> mean_queue_wait_ns;
     std::optional<double> mean_execution_ns;
     std::optional<double> mean_completion_latency_ns;

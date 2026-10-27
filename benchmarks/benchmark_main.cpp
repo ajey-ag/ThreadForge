@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
             configs.push_back({n, threadforge::SchedulingPolicy::Fifo, true});
             configs.push_back({n, threadforge::SchedulingPolicy::Fifo, false});
             configs.push_back({n, threadforge::SchedulingPolicy::Priority, true});
+            configs.push_back({n, threadforge::SchedulingPolicy::WorkStealing, true});
         }
         for (const std::string workload : {"cpu", "short", "mixed", "blocking", "batch"}) {
             const auto count = workload == "batch" ? tasks * 10 : tasks;
@@ -123,7 +124,8 @@ int main(int argc, char** argv) {
                     const auto result = config.workers == 0 ? serial : measure(workload, count, iterations, config);
                     if (result.checksum != serial.checksum) { throw std::runtime_error("Benchmark checksum mismatch"); }
                     out << workload << ',' << count << ',' << iterations << ',' << config.workers << ','
-                        << (config.workers == 0 ? "serial" : config.policy == threadforge::SchedulingPolicy::Fifo ? "fifo" : "priority")
+                        << (config.workers == 0 ? "serial" : config.policy == threadforge::SchedulingPolicy::Fifo ? "fifo" :
+                            config.policy == threadforge::SchedulingPolicy::Priority ? "priority" : "stealing")
                         << ',' << config.timing << ',' << repeat << ',' << result.elapsed << ','
                         << static_cast<double>(count) / result.elapsed << ',' << result.mean << ','
                         << result.p50 << ',' << result.p95 << ',' << result.p99 << ',';
